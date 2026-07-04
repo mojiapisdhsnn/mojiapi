@@ -732,48 +732,26 @@ func sendError(w http.ResponseWriter, status int, message string) {
 }
 
 func getPublicHost() string {
-	if val, ok := os.LookupEnv("PUBLIC_DOMAIN"); ok {
-		return val
-	}
-	if val, ok := os.LookupEnv("TCP_PROXY_DOMAIN"); ok {
-		return val
-	}
-	if val, ok := os.LookupEnv("RAILWAY_TCP_PROXY_DOMAIN"); ok {
-		return val
-	}
-	if val, ok := os.LookupEnv("RAILWAY_PUBLIC_DOMAIN"); ok {
-		return val
-	}
-	return config.Host
+	return "asdasd.orkestr.run"
 }
 
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
 func initConfig() {
-	config.Port = getEnvInt("PORT", 8000)
-	config.Secret = getEnv("SECRET_KEY", secureRandomString(32))
-	config.Host = getEnv("PUBLIC_DOMAIN", getEnv("RAILWAY_PUBLIC_DOMAIN", "localhost"))
-
-	config.WsPath = getEnv("WS_PATH", "/ws")
-	if config.WsPath == "" || config.WsPath == "/" {
-		config.WsPath = "/ws"
-	} else if !strings.HasPrefix(config.WsPath, "/") {
-		config.WsPath = "/" + config.WsPath
-	}
-
-	adminPassword = getEnv("ADMIN_PASSWORD", "")
-	if adminPassword == "" {
-		adminPassword = secureRandomString(12)
-		log.Println("=================================================================")
-		log.Printf(" ⚠️ NO ADMIN_PASSWORD SET IN ENV! Auto-generated: %s\n", adminPassword)
-		log.Println("=================================================================")
-	}
+	config.Port = 8000
+	config.Secret = "orkestr_static_secret"
+	config.Host = "asdasd.orkestr.run"
+	config.WsPath = "/ws"
+	adminPassword = "771177"
 	hashedPassword = hashPassword(adminPassword)
+	log.Println("=================================================================")
+	log.Printf(" ⚠️ ADMIN_PASSWORD HARDCODED TO: %s\n", adminPassword)
+	log.Println("=================================================================")
 }
 
 func initDataDir() {
-	dataDir = getEnv("DATA_DIR", "/data")
+	dataDir = "/data"
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		dataDir = "/tmp"
 		log.Printf("⚠️ /data is not writable (%v). Using /tmp. DATA WILL BE LOST ON RESTART!", err)
