@@ -34,7 +34,6 @@ import (
 
 // ─── Constants & Embedded HTML ───────────────────────────────────────────────
 
-const AllowedSNIs = "play.google.com,www.google.com,google.com,gemini.google.com,aistudio.google.com,notebooklm.google.com,labs.google.com,meet.google.com,accounts.google.com,ogs.google.com,mail.google.com,calendar.google.com,drive.google.com,docs.google.com,chat.google.com,maps.google.com,translate.google.com,assistant.google.com,lens.google.com,safebrowsing.google.com"
 const SessionCookie = "rg_session"
 const SessionTTL = 7 * 24 * time.Hour
 
@@ -504,57 +503,35 @@ var (
 	wsSettings      SubSettings
 	subMutex        sync.RWMutex
 
-	rcMutex              sync.RWMutex
-
 	sessions     = make(map[string]time.Time)
 	sessionMutex sync.RWMutex
 
 	loginAttempts = make(map[string][]time.Time)
 	loginMutex    sync.Mutex
 
-
-	dataDir        string
-	linksFile      string
-	rSetFile       string
-	wSetFile       string
-	xSetFile       string
-	rcFile         string
-	xrayBinPath    = "/usr/local/bin/xray"
-	xrayConfigPath string
+	dataDir   string
+	linksFile string
+	wSetFile  string
 
 	configMutex sync.Mutex
-	reloadChan  = make(chan struct{}, 1)
 
+	// 64 KB I/O buffers per connection halve the syscall count vs 32 KB
+	// for the common case of streaming large payloads.
 	wsUpgrader = websocket.Upgrader{
 		CheckOrigin:     func(r *http.Request) bool { return true },
-		ReadBufferSize:  32 * 1024,
-		WriteBufferSize: 32 * 1024,
+		ReadBufferSize:  64 * 1024,
+		WriteBufferSize: 64 * 1024,
+	}
+
+	// Shared dialer: sets TCP keepalive once at dial time, avoiding a
+	// type-assertion on every new connection.
+	tcpDialer = &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
 )
 
 // ─── Core Helpers ────────────────────────────────────────────────────────────
-
-func getRandomIP(val string) string {
-	if !strings.Contains(val, "/") {
-		return val
-	}
-	_, ipNet, err := net.ParseCIDR(val)
-	if err != nil {
-		return val
-	}
-	ip4 := ipNet.IP.To4()
-	if ip4 != nil {
-		ones, _ := ipNet.Mask.Size()
-		hostBits := 32 - ones
-		if hostBits > 0 && hostBits < 31 {
-			offset := mathrand.Int31n(1 << hostBits)
-			ipInt := uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
-			ipInt = (ipInt & ^(uint32(1<<hostBits) - 1)) | uint32(offset)
-			return fmt.Sprintf("%d.%d.%d.%d", byte(ipInt>>24), byte(ipInt>>16), byte(ipInt>>8), byte(ipInt))
-		}
-	}
-	return val
-}
 
 func getAllIPs(val string) []string {
 	if !strings.Contains(val, "/") {
@@ -609,22 +586,6 @@ func atomicWriteJSON(filename string, data interface{}) error {
 	return nil
 }
 
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
-}
-
-func getEnvInt(key string, fallback int) int {
-	if valStr, ok := os.LookupEnv(key); ok {
-		if val, err := strconv.Atoi(valStr); err == nil {
-			return val
-		}
-	}
-	return fallback
-}
-
 func secureRandomString(length int) string {
 	b := make([]byte, length)
 	if _, err := rand.Read(b); err != nil {
@@ -638,9 +599,10 @@ func generateUUID() string {
 	if _, err := rand.Read(b); err != nil {
 		log.Fatalf("CRITICAL: crypto/rand failed: %v", err)
 	}
+	// Set UUID v4 version and variant bits.
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	return formatUUID(b)
 }
 
 func hashPassword(pw string) string {
@@ -650,22 +612,24 @@ func hashPassword(pw string) string {
 }
 
 func sendJSON(w http.ResponseWriter, status int, data interface{}) {
+	b, err := json.Marshal(data)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+	_, _ = w.Write(b)
 }
 
 func sendError(w http.ResponseWriter, status int, message string) {
 	sendJSON(w, status, map[string]string{"detail": message})
 }
 
-func getPublicHost() string {
-	if host := os.Getenv("PUBLIC_HOST"); host != "" {
-		return host
-	}
-	// Fallback, but warn the user to set PUBLIC_HOST
-	return "localhost"
-}
+// publicHost is set once at startup by initConfig and never changes.
+var publicHost string
+
+func getPublicHost() string { return publicHost }
 
 
 // ─── Initialization ──────────────────────────────────────────────────────────
@@ -682,7 +646,12 @@ func initConfig() {
 		config.Port = 8000
 	}
 	config.Secret = "orkestr_static_secret"
-	config.Host = getPublicHost()
+	if h := os.Getenv("PUBLIC_HOST"); h != "" {
+		publicHost = h
+	} else {
+		publicHost = "localhost"
+	}
+	config.Host = publicHost
 	config.WsPath = "/ws"
 	adminPassword = "771177"
 	hashedPassword = hashPassword(adminPassword)
@@ -736,23 +705,72 @@ func generateLinks(uid, label string, sub SubSettings) []string {
 	if len(fps) == 0 {
 		fps = DefaultFingerprints
 	}
-	ip := ips[0]
-	sni := snis[0]
-	fp := fps[0]
 
-	q := url.Values{}
-	q.Set("type", "ws")
-	q.Set("security", "tls")
-	q.Set("path", config.WsPath)
-	q.Set("encryption", "none")
-	q.Set("insecure", "1")
-	q.Set("allowInsecure", "1")
-	q.Set("host", sni)
-	q.Set("sni", sni)
-	q.Set("fp", fp)
-	
-	fragment := url.PathEscape(label + " | WS")
-	return []string{fmt.Sprintf("vless://%s@%s:443?%s#%s", uid, ip, q.Encode(), fragment)}
+	// Expand any CIDR entries to individual IPs (capped at 256 per entry).
+	var expandedIPs []string
+	for _, entry := range ips {
+		expandedIPs = append(expandedIPs, getAllIPs(entry)...)
+	}
+
+	// Build every combination of (ip, sni, fingerprint).
+	type combo struct {
+		ip  string
+		sni string
+		fp  string
+	}
+	var all []combo
+	for _, ip := range expandedIPs {
+		for _, sni := range snis {
+			for _, fp := range fps {
+				all = append(all, combo{ip, sni, fp})
+			}
+		}
+	}
+	if len(all) == 0 {
+		return nil
+	}
+
+	// If N > 0, pick N random combos (with replacement when N > len).
+	var selected []combo
+	n := sub.N
+	if n > 0 {
+		selected = make([]combo, n)
+		for i := range selected {
+			selected[i] = all[mathrand.Intn(len(all))]
+		}
+	} else {
+		// N == 0 → return all combinations.
+		selected = all
+	}
+
+	// Deduplicate to avoid identical links.
+	seen := make(map[string]struct{}, len(selected))
+	var out []string
+	for i, c := range selected {
+		q := url.Values{}
+		q.Set("type", "ws")
+		q.Set("security", "tls")
+		q.Set("path", config.WsPath)
+		q.Set("encryption", "none")
+		q.Set("insecure", "1")
+		q.Set("allowInsecure", "1")
+		q.Set("host", c.sni)
+		q.Set("sni", c.sni)
+		q.Set("fp", c.fp)
+
+		// Append index so duplicate (ip,sni,fp) combos still get unique fragments.
+		suffix := ""
+		if n > 0 {
+			suffix = fmt.Sprintf(" %d", i+1)
+		}
+		fragment := url.PathEscape(fmt.Sprintf("%s | WS%s", label, suffix))
+		link := fmt.Sprintf("vless://%s@%s:443?%s#%s", uid, c.ip, q.Encode(), fragment)
+		if _, dup := seen[link]; !dup {
+			seen[link] = struct{}{}
+			out = append(out, link)
+		}
+	}
+	return out
 }
 
 // ─── Background Polling & Maintenance ────────────────────────────────────────
@@ -794,13 +812,43 @@ func sessionCleanupLoop(ctx context.Context) {
 
 // ─── Native VLESS WS Implementation ──────────────────────────────────────────
 
-// wsRelayBufPool reuses 32 KB read buffers across relay goroutines to avoid
+const (
+	// wsReadLimit caps the size of the first VLESS frame to prevent a
+	// malicious or broken client from causing an OOM with a huge frame.
+	wsReadLimit = 256 * 1024 // 256 KB
+
+	// wsIdleTimeout is how long we wait for any traffic before closing
+	// a stalled connection. The WS ping ticker fires at half this interval
+	// so a missed pong will be caught within one full period.
+	wsIdleTimeout = 120 * time.Second
+
+	// wsPingInterval is how often we send a WebSocket ping to the client.
+	wsPingInterval = 55 * time.Second
+)
+
+// wsRelayBufPool reuses 64 KB read buffers across relay goroutines to avoid
 // per-connection heap allocations that would pressure the GC under high load.
 var wsRelayBufPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 64*1024)
 		return &buf
 	},
+}
+
+// formatUUID formats 16 raw bytes into a standard UUID string without
+// allocating via fmt.Sprintf — saves one alloc per incoming connection.
+func formatUUID(b []byte) string {
+	var buf [36]byte
+	hex.Encode(buf[0:8], b[0:4])
+	buf[8] = '-'
+	hex.Encode(buf[9:13], b[4:6])
+	buf[13] = '-'
+	hex.Encode(buf[14:18], b[6:8])
+	buf[18] = '-'
+	hex.Encode(buf[19:23], b[8:10])
+	buf[23] = '-'
+	hex.Encode(buf[24:36], b[10:16])
+	return string(buf[:])
 }
 
 func parseVlessHeader(chunk []byte) (uuid string, command byte, address string, port uint16, payload []byte, err error) {
@@ -808,8 +856,7 @@ func parseVlessHeader(chunk []byte) (uuid string, command byte, address string, 
 		return "", 0, "", 0, nil, errors.New("chunk too small for VLESS header")
 	}
 
-	u := chunk[1:17]
-	uuid = fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+	uuid = formatUUID(chunk[1:17])
 
 	pos := 17
 	addonLen := int(chunk[pos])
@@ -878,7 +925,12 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	// 1. Read first frame (contains VLESS header)
+	// Cap first-frame size: prevents OOM if a broken/malicious client
+	// sends a giant VLESS header frame.
+	ws.SetReadLimit(wsReadLimit)
+
+	// 1. Read first frame (VLESS header) with a handshake deadline.
+	_ = ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
 	msgType, firstChunk, err := ws.ReadMessage()
 	if err != nil || msgType != websocket.BinaryMessage {
 		return
@@ -889,28 +941,25 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. UUID authentication — reject fake/inactive UUIDs
+	// 2. UUID authentication — reject fake/inactive UUIDs.
 	if !isUUIDActive(uid) {
 		_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "unauthorized"), time.Now().Add(time.Second))
 		return
 	}
 
-	// 3. VLESS spec requires command 1 (TCP) for proxies
+	// 3. VLESS spec requires command 1 (TCP) for proxies.
 	if command != 1 {
 		return
 	}
 
-	// 4. Dial target destination (Fix: Safely joining IP and Port for IPv6 Support)
-	rawConn, err := net.DialTimeout("tcp", net.JoinHostPort(address, strconv.Itoa(int(port))), 5*time.Second)
+	// 4. Dial target. Use AppendUint into a stack buffer to avoid
+	//    allocating a string for the port on every connection.
+	var portBuf [5]byte // max 5 digits for port 0–65535
+	portStr := strconv.AppendUint(portBuf[:0], uint64(port), 10)
+	targetConn, err := tcpDialer.Dial("tcp", net.JoinHostPort(address, string(portStr)))
 	if err != nil {
 		return
 	}
-	// Enable TCP keepalive so dead peers are detected quickly
-	if tc, ok := rawConn.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(30 * time.Second)
-	}
-	targetConn := rawConn
 	defer targetConn.Close()
 
 	if len(payload) > 0 {
@@ -919,53 +968,102 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	errCh := make(chan error, 2)
+	// 5. Lift the read limit now that we are in relay mode — data frames
+	//    can be up to 64 KB (our buffer size) and must not be rejected.
+	ws.SetReadLimit(1<<63 - 1)
 
-	// 5. Relay: Client (WS) -> Target (TCP)
+	// 6. Ping/pong keepalive.
+	//    PongHandler resets the read deadline so the connection stays alive
+	//    as long as the client keeps responding to pings.
+	//    Clear the handshake deadline before entering relay mode.
+	_ = ws.SetReadDeadline(time.Time{})
+	ws.SetPongHandler(func(string) error {
+		_ = ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
+		return nil
+	})
+
+	pingTicker := time.NewTicker(wsPingInterval)
+	// done is closed when the relay tears down, which causes the ping
+	// goroutine to exit immediately rather than blocking on a stopped
+	// ticker that will never send another value.
+	done := make(chan struct{})
+	defer func() {
+		close(done)
+		pingTicker.Stop()
+	}()
+
+	errCh := make(chan error, 3)
+
+	// Ping sender — exits when done is closed OR a ping write fails.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-pingTicker.C:
+				deadline := time.Now().Add(10 * time.Second)
+				if err := ws.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					errCh <- err
+					return
+				}
+				// Arm the read deadline: a missed pong will cause the next
+				// NextReader call to time out and tear down the relay.
+				_ = ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
+			}
+		}
+	}()
+
+	// 7. Relay: Client (WS) -> Target (TCP)
 	go func() {
 		bufPtr := wsRelayBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer wsRelayBufPool.Put(bufPtr)
 		for {
-			_, r, err := ws.NextReader()
+			_, reader, err := ws.NextReader()
 			if err != nil {
 				errCh <- err
 				return
 			}
-			if _, err := io.CopyBuffer(targetConn, r, buf); err != nil {
+			if _, err := io.CopyBuffer(targetConn, reader, buf); err != nil {
 				errCh <- err
 				return
 			}
 		}
 	}()
 
-	// 6. Relay: Target (TCP) -> Client (WS)
-	// Pool-allocated buffer — returned when this goroutine exits.
+	// 8. Relay: Target (TCP) -> Client (WS)
 	go func() {
 		bufPtr := wsRelayBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer wsRelayBufPool.Put(bufPtr)
 
-		// Pre-allocate header+data buffer once (cap = 2 + 32 KB).
-		// append into it on the first packet avoids an extra heap copy.
-		headerBuf := make([]byte, 2, 2+32*1024)
-		headerBuf[0] = 0x00 // VLESS response version
-		headerBuf[1] = 0x00 // addon length = 0
+		// First packet must carry the 2-byte VLESS response header
+		// (version=0x00, addon-len=0x00) prepended to the data.
+		// We write directly into buf[0:2] and read into buf[2:],
+		// so the whole first packet is a single contiguous slice —
+		// zero extra allocation.
+		buf[0] = 0x00 // VLESS response version
+		buf[1] = 0x00 // addon length = 0
 
 		firstPacket := true
 		for {
-			n, err := targetConn.Read(buf)
+			var readBuf []byte
+			if firstPacket {
+				readBuf = buf[2:] // leave room for the 2-byte header
+			} else {
+				readBuf = buf
+			}
+			n, err := targetConn.Read(readBuf)
 			if n > 0 {
 				var data []byte
 				if firstPacket {
-					// Prepend 2-byte VLESS header without a separate allocation.
-					data = append(headerBuf[:2], buf[:n]...)
+					data = buf[:2+n] // header + data, no alloc
 					firstPacket = false
 				} else {
 					data = buf[:n]
 				}
-				if err := ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
-					errCh <- err
+				if wErr := ws.WriteMessage(websocket.BinaryMessage, data); wErr != nil {
+					errCh <- wErr
 					return
 				}
 			}
@@ -976,7 +1074,9 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Block until an error occurs (or disconnects)
+	// Block until any goroutine signals disconnect/error.
+	// The deferred close(done), ws.Close(), and targetConn.Close() will
+	// unblock all remaining goroutines.
 	<-errCh
 }
 
@@ -1053,12 +1153,18 @@ func checkLoginRate(ip string) bool {
 }
 
 func getClientIP(r *http.Request) string {
+	// On Scalingo (and most PaaS), the real client IP is the leftmost
+	// entry in X-Forwarded-For. Iterating from the right would return
+	// the platform router's IP, collapsing all clients into one rate
+	// limit bucket.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			if ip := strings.TrimSpace(parts[i]); ip != "" {
+		// Find the first comma — everything before it is the client IP.
+		if idx := strings.IndexByte(xff, ','); idx > 0 {
+			if ip := strings.TrimSpace(xff[:idx]); ip != "" {
 				return ip
 			}
+		} else if ip := strings.TrimSpace(xff); ip != "" {
+			return ip
 		}
 	}
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -1098,11 +1204,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	sessionMutex.Unlock()
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     SessionCookie,
-		Value:    token,
-		MaxAge:   int(SessionTTL.Seconds()),
+		Name:  SessionCookie,
+		Value: token,
+		MaxAge: int(SessionTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   r.URL.Scheme == "https",
+		// Scalingo terminates TLS before us; check X-Forwarded-Proto
+		// because r.URL.Scheme is always empty behind a reverse proxy.
+		Secure:   r.Header.Get("X-Forwarded-Proto") == "https" || r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		Path:     "/",
 	})
