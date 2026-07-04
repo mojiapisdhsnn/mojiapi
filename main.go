@@ -209,7 +209,7 @@ const DashboardHTML = `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta char
         
         <div class="status-row"><span class="status-key"><i class="ti ti-versions"></i> نسخه</span><span class="status-val">Null API v1.5 (Pro)</span></div>
         <div class="status-row"><span class="status-key"><i class="ti ti-brand-python"></i> فریم‌ورک</span><span class="status-val">Go 1.22 + Native WS</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-cloud"></i> پلتفرم</span><span class="status-val">Orkestr</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-cloud"></i> پلتفرم</span><span class="status-val">Scalingo</span></div>
       </div>
       <div class="card">
         <div class="card-title"><i class="ti ti-key"></i> تغییر رمز عبور</div>
@@ -660,16 +660,29 @@ func sendError(w http.ResponseWriter, status int, message string) {
 }
 
 func getPublicHost() string {
-	return "asdasd.orkestr.run"
+	if host := os.Getenv("PUBLIC_HOST"); host != "" {
+		return host
+	}
+	// Fallback, but warn the user to set PUBLIC_HOST
+	return "localhost"
 }
 
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
 func initConfig() {
-	config.Port = 8000
+	portStr := os.Getenv("PORT")
+	if portStr != "" {
+		if p, err := strconv.Atoi(portStr); err == nil {
+			config.Port = p
+		} else {
+			config.Port = 8000
+		}
+	} else {
+		config.Port = 8000
+	}
 	config.Secret = "orkestr_static_secret"
-	config.Host = "asdasd.orkestr.run"
+	config.Host = getPublicHost()
 	config.WsPath = "/ws"
 	adminPassword = "771177"
 	hashedPassword = hashPassword(adminPassword)
@@ -860,6 +873,7 @@ func isUUIDActive(uid string) bool {
 func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("WS Upgrade failed: %v", err)
 		return
 	}
 	defer ws.Close()
