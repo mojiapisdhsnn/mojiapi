@@ -1,7 +1,6 @@
 package main
 
 import (
-
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -58,7 +57,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     });
     const d = await r.json();
     if(r.ok && d.ok) {
-      location.href = '/';
+      location.href = '/dashboard';
     } else {
       errText.textContent = d.detail || 'رمز اشتباه است';
       err.classList.add('show');
@@ -469,10 +468,10 @@ document.addEventListener('DOMContentLoaded',async()=>{
 // ─── Structs ─────────────────────────────────────────────────────────────────
 
 type ConfigStruct struct {
-	Port               int
-	Secret             string
-	Host               string
-	WsPath             string
+	Port   int
+	Secret string
+	Host   string
+	WsPath string
 }
 
 type Link struct {
@@ -489,7 +488,6 @@ type SubSettings struct {
 	N            int      `json:"n"`
 }
 
-
 // ─── Global State & Synchronization ──────────────────────────────────────────
 
 var (
@@ -500,8 +498,8 @@ var (
 	links      = make(map[string]*Link)
 	linksMutex sync.RWMutex
 
-	wsSettings      SubSettings
-	subMutex        sync.RWMutex
+	wsSettings SubSettings
+	subMutex   sync.RWMutex
 
 	sessions     = make(map[string]time.Time)
 	sessionMutex sync.RWMutex
@@ -630,7 +628,6 @@ func sendError(w http.ResponseWriter, status int, message string) {
 var publicHost string
 
 func getPublicHost() string { return publicHost }
-
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
@@ -1080,7 +1077,6 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 	<-errCh
 }
 
-
 // ─── HTTP Middleware & Auth ──────────────────────────────────────────────────
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -1204,9 +1200,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	sessionMutex.Unlock()
 
 	http.SetCookie(w, &http.Cookie{
-		Name:  SessionCookie,
-		Value: token,
-		MaxAge: int(SessionTTL.Seconds()),
+		Name:     SessionCookie,
+		Value:    token,
+		MaxAge:   int(SessionTTL.Seconds()),
 		HttpOnly: true,
 		// Scalingo terminates TLS before us; check X-Forwarded-Proto
 		// because r.URL.Scheme is always empty behind a reverse proxy.
@@ -1270,19 +1266,19 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, 200, map[string]string{
-		"service":  "github.com/null-detected",
-		"version":  "1.6.0 (Native WS)",
+		"service":  "https://github.com/null-detected",
+		"version":  "1.0.0",
 		"status":   "active",
 		"host":     getPublicHost(),
-		"protocol": "REALITY & WS & XHTTP",
+		"protocol": "WS (websocket)",
 	})
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	sendJSON(w, 200, map[string]interface{}{
-		"status":      "ok",
-		
+		"status": "ok",
+
 		"ws_path":     config.WsPath,
 		"http_port":   config.Port,
 		"public_host": getPublicHost(),
@@ -1296,11 +1292,11 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	linksMutex.RUnlock()
 
 	sendJSON(w, 200, map[string]interface{}{
-		"timestamp":          time.Now().Format(time.RFC3339),
-		"ws_path":            config.WsPath,
-				"links_count":        lc,
-		"public_host":        getPublicHost(),
-			})
+		"timestamp":   time.Now().Format(time.RFC3339),
+		"ws_path":     config.WsPath,
+		"links_count": lc,
+		"public_host": getPublicHost(),
+	})
 }
 
 func handleGetLinks(w http.ResponseWriter, r *http.Request) {
@@ -1320,12 +1316,12 @@ func handleGetLinks(w http.ResponseWriter, r *http.Request) {
 		}
 
 		res = append(res, map[string]interface{}{
-			"uuid":             uid,
-			"label":            data.Label,
-			"active":           data.Active,
-			"created_at":       data.CreatedAt,
-			"vless_link":       defW,
-			"vless_ws_link":    defW,
+			"uuid":          uid,
+			"label":         data.Label,
+			"active":        data.Active,
+			"created_at":    data.CreatedAt,
+			"vless_link":    defW,
+			"vless_ws_link": defW,
 		})
 	}
 	sendJSON(w, 200, map[string]interface{}{"links": res})
@@ -1412,8 +1408,6 @@ func handleDeleteLink(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, 200, map[string]bool{"ok": true})
 }
 
-
-
 func handleGetSub(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("id")
 	linksMutex.RLock()
@@ -1445,13 +1439,13 @@ func handleSubSettings(w http.ResponseWriter, r *http.Request) {
 		subMutex.RLock()
 		defer subMutex.RUnlock()
 		sendJSON(w, 200, map[string]interface{}{
-			"ws":      wsSettings,
+			"ws": wsSettings,
 		})
 		return
 	}
 	defer r.Body.Close()
 	var body struct {
-		Ws      SubSettings `json:"ws"`
+		Ws SubSettings `json:"ws"`
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 65536)
@@ -1540,7 +1534,6 @@ func main() {
 	mux.HandleFunc("GET /api/sub-settings", requireAuth(handleSubSettings))
 	mux.HandleFunc("POST /api/sub-settings", requireAuth(handleSubSettings))
 
-
 	handler := corsMiddleware(mux)
 
 	server := &http.Server{
@@ -1548,8 +1541,6 @@ func main() {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		// ReadTimeout and WriteTimeout removed: XHTTP uses long-lived
-		// streaming connections that would be killed by these limits.
 	}
 
 	go func() {
@@ -1567,8 +1558,6 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server forced to shutdown: %v", err)
 	}
-
-
 
 	log.Println("✅ Shutdown complete.")
 }
