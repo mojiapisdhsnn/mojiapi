@@ -693,6 +693,9 @@ func initDataDir() {
 	}
 	if b, err := os.ReadFile(wSetFile); err == nil {
 		_ = json.Unmarshal(b, &wsSettings)
+	} else {
+		wsSettings.Enabled = true
+		_ = atomicWriteJSON(wSetFile, wsSettings)
 	}
 
 	if len(links) == 0 {
