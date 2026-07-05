@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -824,13 +823,11 @@ const (
 	wsPingInterval = 55 * time.Second
 )
 
-// wsRelayBufPool reuses 128 KB read buffers across relay goroutines to avoid
+// wsRelayBufPool reuses 64 KB read buffers across relay goroutines to avoid
 // per-connection heap allocations that would pressure the GC under high load.
-// 128 KB halves the number of Read/Write round-trips compared with 64 KB for
-// large streaming payloads, with negligible extra memory per idle connection.
 var wsRelayBufPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 128*1024)
+		buf := make([]byte, 64*1024)
 		return &buf
 	},
 }
@@ -975,11 +972,8 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 	// 6. Ping/pong keepalive.
 	//    PongHandler resets the read deadline so the connection stays alive
 	//    as long as the client keeps responding to pings.
-	//    Arm the initial relay read deadline now; the pong handler below is
-	//    the ONLY place that ever resets it during relay. gorilla calls the
-	//    pong handler from inside NextReader's read loop — i.e. on the same
-	//    OS thread as the reader goroutine — so there is no data race.
-	_ = ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
+	//    Clear the handshake deadline before entering relay mode.
+	_ = ws.SetReadDeadline(time.Time{})
 	ws.SetPongHandler(func(string) error {
 		_ = ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
 		return nil
@@ -990,11 +984,6 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 	// goroutine to exit immediately rather than blocking on a stopped
 	// ticker that will never send another value.
 	done := make(chan struct{})
-	// wsMu serialises ALL ws.Write* calls. gorilla/websocket allows exactly
-	// one concurrent writer — without this mutex the ping goroutine and the
-	// TCP→WS relay goroutine race each other, silently corrupting the frame
-	// stream and causing random disconnections.
-	var wsMu sync.Mutex
 	defer func() {
 		close(done)
 		pingTicker.Stop()
@@ -1003,10 +992,6 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 	errCh := make(chan error, 3)
 
 	// Ping sender — exits when done is closed OR a ping write fails.
-	// wsMu guards ws.WriteControl so it cannot race the concurrent data-frame
-	// writes in the TCP→WS goroutine. Read-deadline management belongs solely
-	// to the pong handler; calling SetReadDeadline here from a separate goroutine
-	// would race with NextReader and is therefore removed.
 	go func() {
 		for {
 			select {
@@ -1014,39 +999,29 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 				return
 			case <-pingTicker.C:
 				deadline := time.Now().Add(10 * time.Second)
-				wsMu.Lock()
-				err := ws.WriteControl(websocket.PingMessage, nil, deadline)
-				wsMu.Unlock()
-				if err != nil {
+				if err := ws.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
 					errCh <- err
 					return
 				}
+				// Arm the read deadline: a missed pong will cause the next
+				// NextReader call to time out and tear down the relay.
+				_ = ws.SetReadDeadline(time.Now().Add(wsIdleTimeout))
 			}
 		}
 	}()
 
-	// 7. Relay: Client (WS) → Target (TCP)
-	// tcpWriter wraps targetConn in a 64 KB bufio.Writer so that the many
-	// small Writes that io.CopyBuffer may emit (one per partial network read
-	// within a single WebSocket frame) are coalesced into fewer write(2)
-	// syscalls. We flush explicitly at each WS frame boundary to avoid
-	// introducing artificial latency.
+	// 7. Relay: Client (WS) -> Target (TCP)
 	go func() {
 		bufPtr := wsRelayBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer wsRelayBufPool.Put(bufPtr)
-		tcpWriter := bufio.NewWriterSize(targetConn, 64*1024)
 		for {
 			_, reader, err := ws.NextReader()
 			if err != nil {
 				errCh <- err
 				return
 			}
-			if _, err := io.CopyBuffer(tcpWriter, reader, buf); err != nil {
-				errCh <- err
-				return
-			}
-			if err := tcpWriter.Flush(); err != nil {
+			if _, err := io.CopyBuffer(targetConn, reader, buf); err != nil {
 				errCh <- err
 				return
 			}
@@ -1084,10 +1059,7 @@ func handleNativeWS(w http.ResponseWriter, r *http.Request) {
 				} else {
 					data = buf[:n]
 				}
-				wsMu.Lock()
-				wErr := ws.WriteMessage(websocket.BinaryMessage, data)
-				wsMu.Unlock()
-				if wErr != nil {
+				if wErr := ws.WriteMessage(websocket.BinaryMessage, data); wErr != nil {
 					errCh <- wErr
 					return
 				}
